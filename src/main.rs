@@ -1,19 +1,21 @@
 #![recursion_limit = "1024"]
-#![feature(try_from)] 
+#![feature(custom_attribute)]
+#![feature(try_from)]
 
-extern crate chrono;
-#[macro_use]
-extern crate error_chain;
-
+extern crate dotenv;
+#[macro_use] extern crate error_chain;
 extern crate hyper;
 extern crate itertools;
-
 extern crate select;
+extern crate serde;
+#[macro_use] extern crate serde_derive;
+extern crate serde_json;
 
 use std::convert::TryFrom;
 use std::convert::TryInto;
+use std::io::Write;
 
-use chrono::NaiveDate;
+use serde_json::to_string;
 
 use hyper::client::Client;
 use hyper::client::Response;
@@ -28,7 +30,7 @@ error_chain!{
   foreign_links {
     IO(::std::io::Error);
     HTTP(::hyper::Error);
-    Parse(::chrono::ParseError);
+    JSON(::serde_json::Error);
   }
 
   errors {
@@ -43,14 +45,14 @@ error_chain!{
     }
 }
 
-
-#[derive(Debug)]
+#[derive(Serialize, Deserialize, Debug)]
 struct Corporation {
+  id                : u32,
   name              : String,
   kind              : String,
   purpose           : String,
-  date_incorporated : NaiveDate,
-  date_effective    : NaiveDate,
+  date_incorporated : String,
+  date_effective    : String,
   principal_office  : PrincipalOffice,
   principal_agent   : PrincipalAgent,
   officers          : Vec<Officer>,
@@ -59,23 +61,21 @@ struct Corporation {
   merged_into       : Vec<Merger>
 }
 
-
-#[derive(Debug)]
+#[derive(Serialize, Deserialize, Debug)]
 struct PrincipalOffice {
   address           : Address,
   maintained        : String
 }
 
 
-#[derive(Debug)]
+#[derive(Serialize, Deserialize, Debug)]
 struct PrincipalAgent {
   name              : String,
   address           : Address,
   resigned          : String
 }
 
-
-#[derive(Debug)]
+#[derive(Serialize, Deserialize, Debug)]
 struct Address {
   street            : String,
   city              : String,
@@ -84,30 +84,27 @@ struct Address {
   country           : String,
 }
 
-
-#[derive(Debug)]
+#[derive(Serialize, Deserialize, Debug)]
 struct Officer {
   title             : String,
   name              : String,
   address           : String,
 }
 
-
-#[derive(Debug)]
+#[derive(Serialize, Deserialize, Debug)]
 struct Merger {
-  corp             : String,
-  date             : NaiveDate,
+  corp              : String,
+  date              : String,
 }
 
-
-#[derive(Debug)]
+#[derive(Serialize, Deserialize, Debug)]
 struct Rename {
-  name             : String,
-  date             : NaiveDate,
+  name              : String,
+  date              : String,
 }
 
 
-macro_rules! select_text {
+macro_rules! select {
   ($document:expr, $id:expr) => (
     try!($document.find(Attr("id",  $id))
       .next().map(|node| node.text().trim().into())
@@ -116,25 +113,16 @@ macro_rules! select_text {
 }
 
 
-macro_rules! select_date {
-  ($document:expr, $id:expr, $format:expr) => (
-    try!(NaiveDate::parse_from_str(
-      try!($document.find(Attr("id", $id))
-      .next().map(|node|node.text())
-      .ok_or(ErrorKind::SelectionError($id.into()))).trim(), $format))
-  )
-}
-
-
-impl<'t> TryFrom<&'t Document> for Corporation {
+impl<'t> TryFrom<(u32, &'t Document)> for Corporation {
   type Error = Error;
-  fn try_from(document: &Document) -> Result<Self> {
+  fn try_from((id, document): (u32, &Document)) -> Result<Self> {
     Ok(Corporation {
-      name              : select_text!(document, "MainContent_lblEntityName"),
-      kind              : select_text!(document, "MainContent_lblEntityType"),
-      purpose           : select_text!(document, "MainContent_txtComments"),
-      date_incorporated : select_date!(document, "MainContent_lblOrganisationDate", "%m-%d-%Y"),
-      date_effective    : select_date!(document, "MainContent_lblOrganisationDate", "%m-%d-%Y"),
+      id                : id,
+      name              : select!(document, "MainContent_lblEntityName"),
+      kind              : select!(document, "MainContent_lblEntityType"),
+      purpose           : select!(document, "MainContent_txtComments"),
+      date_incorporated : select!(document, "MainContent_lblOrganisationDate"),
+      date_effective    : select!(document, "MainContent_lblOrganisationDate"),
       principal_office  : try!(document.try_into()),
       principal_agent   : try!(document.try_into()),
       officers          :
@@ -162,11 +150,10 @@ impl<'t> TryFrom<&'t Document> for Corporation {
                 .ok_or("could not parse rename name")?
                 .text().trim().into();
               let date =
-                NaiveDate::parse_from_str(
                   children.nth(1)
                     .map(|node|node.text())
                     .ok_or(ErrorKind::SelectionError("could not select rename date".into()))?
-                .trim(), "%m-%d-%Y")?;
+                .trim().into();
               Ok(Rename {
                 name: name,
                 date: date
@@ -186,11 +173,10 @@ impl<'t> TryFrom<&'t Document> for Corporation {
                 .and_then(|href| href.split('=').nth(1))
                 .ok_or("could not parse merger name")?);
               let date =
-                NaiveDate::parse_from_str(
                   children.nth(2)
                     .map(|node| node.text())
                     .ok_or(ErrorKind::SelectionError("could not select merger date".into()))?
-                .trim(), "%m-%d-%Y")?;
+                .trim().into();
               Ok(Merger {
                 corp: corp,
                 date: date
@@ -210,11 +196,10 @@ impl<'t> TryFrom<&'t Document> for Corporation {
                 .and_then(|href| href.split('=').nth(1))
                 .ok_or("could not parse merger name")?);
               let date =
-                NaiveDate::parse_from_str(
                   children.nth(2)
                     .map(|node| node.text())
                     .ok_or(ErrorKind::SelectionError("could not select merger date".into()))?
-                .trim(), "%m-%d-%Y")?;
+                .trim().into();
               Ok(Merger {
                 corp: corp,
                 date: date
@@ -231,13 +216,13 @@ impl<'t> TryFrom<&'t Document> for PrincipalOffice {
     Ok(PrincipalOffice {
       address           :
         Address {   
-          street        : select_text!(document, "MainContent_lblPrincipleStreet"),
-          city          : select_text!(document, "MainContent_lblPrincipleCity"),
-          state         : select_text!(document, "MainContent_lblPrincipleState"),
-          zip           : select_text!(document, "MainContent_lblPrincipleZip"),
-          country       : select_text!(document, "MainContent_lblPrincipleCountry"),
+          street        : select!(document, "MainContent_lblPrincipleStreet"),
+          city          : select!(document, "MainContent_lblPrincipleCity"),
+          state         : select!(document, "MainContent_lblPrincipleState"),
+          zip           : select!(document, "MainContent_lblPrincipleZip"),
+          country       : select!(document, "MainContent_lblPrincipleCountry"),
         },    
-      maintained        : select_text!(document, "MainContent_lblConsentFlag")})
+      maintained        : select!(document, "MainContent_lblConsentFlag")})
   }
 }
 
@@ -246,16 +231,16 @@ impl<'t> TryFrom<&'t Document> for PrincipalAgent {
   type Error = Error;
   fn try_from(document: &Document) -> Result<Self> {
     Ok(PrincipalAgent {
-      name              : select_text!(document, "MainContent_lblResidentAgentName"),
+      name              : select!(document, "MainContent_lblResidentAgentName"),
       address           :
         Address {   
-          street        : select_text!(document, "MainContent_lblResidentStreet"),
-          city          : select_text!(document, "MainContent_lblResidentCity"),
-          state         : select_text!(document, "MainContent_lblResidentState"),
-          zip           : select_text!(document, "MainContent_lblResidentZip"),
-          country       : select_text!(document, "MainContent_lblResidentCountry"),
-        },    
-      resigned          : select_text!(document, "MainContent_lblResidentAgentFlag")})
+          street        : select!(document, "MainContent_lblResidentStreet"),
+          city          : select!(document, "MainContent_lblResidentCity"),
+          state         : select!(document, "MainContent_lblResidentState"),
+          zip           : select!(document, "MainContent_lblResidentZip"),
+          country       : select!(document, "MainContent_lblResidentCountry"),
+        },
+      resigned          : select!(document, "MainContent_lblResidentAgentFlag")})
   }
 }
 
@@ -268,35 +253,56 @@ fn fetch(client: &Client, id: u32) -> Result<Response> {
 }
 
 
-fn select(document: &Document) -> Result<Corporation>
+fn select(id: u32, document: &Document) -> Result<Corporation>
 {
   if let Some(error_message) = document.find(Class("ErrorMessage")).next()
   {
     bail!(ErrorKind::RemoteError(error_message.text()))
   }
-  document.try_into()
+  (id, document).try_into()
 }
 
-
-fn run() -> Result<()> {
-  let client = Client::new();
-  let result = try!(fetch(&client, 000963237));
-  let result = try!(Document::from_read(result));
-  let result = try!(select(&result));
-  println!("{:?}", result);
-  Ok(())
+fn run(client: &Client, id: u32) -> Result<Corporation> {
+  let raw = fetch(client, id)?;
+  let doc = Document::from_read(raw)?;
+  select(id, &doc)
 }
-
 
 fn main() {
-  if let Err(ref e) = run() {
-    println!("error: {}", e);
-    for e in e.iter().skip(2) {
-      println!("caused by: {}", e);
+  let client = Client::new();
+
+  let mut stdout = std::io::stdout();
+  let mut stdout = stdout.lock();
+  let mut stderr = std::io::stderr();
+  let mut stderr = stderr.lock();
+
+  //let range = (0..1000000);
+  let range = (0..100);
+
+  let results = range.clone().zip(
+    range.clone()
+      .map(|id| run(&client, id))
+      .map(|result|
+        result.and_then(|corp|
+          to_string(&corp)
+            .chain_err(|| format!("could not serialize")))));
+
+  for (id, result) in results {
+    match result {
+      Ok(result) => {writeln!(stdout, "{}", result);},
+      Err(ref e) => {
+        writeln!(stderr, "error on {}: {}", id, e);
+        for e in e.iter().skip(1) {
+          writeln!(stderr, "caused by: {}", e);
+        }
+        if let Some(backtrace) = e.backtrace() {
+          writeln!(stderr, "backtrace: {:?}", backtrace);
+        }
+
+        if let &Error(ErrorKind::RemoteError(_), _) = e {
+          continue;
+        } else {::std::process::exit(1);}
+      }
     }
-    if let Some(backtrace) = e.backtrace() {
-      println!("backtrace: {:?}", backtrace);
-    }
-    std::process::exit(1);
   }
 }
